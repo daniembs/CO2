@@ -1017,7 +1017,7 @@ corr_struct_wide <- corr_struct %>%
 
 ar_collapse <- results_chem %>%
   filter(window == WINDOW_PRIMARY, p.fdr < FDR_THRESHOLD) %>%
-  inner_join(
+  left_join(
     results_autocor_main %>%
       filter(window == WINDOW_PRIMARY) %>%
       select(window, file, compound, response,
@@ -1028,7 +1028,8 @@ ar_collapse <- results_chem %>%
     by = c("window", "file", "compound", "response")
   ) %>%
   mutate(
-    pct_attenuation = 100 * (abs(estimate) - abs(ar_estimate)) / abs(estimate),
+    pct_attenuation = ifelse(estimate == 0, NA_real_,
+                             100 * (abs(estimate) - abs(ar_estimate)) / abs(estimate)),
     survives_AR     = ar_p < 0.05
   ) %>%
   select(window, file, compound, response,
@@ -1158,6 +1159,7 @@ message("  Compounds with >= ", MIN_OBS, " same-day matches: ",
 # ---- 13b. Same-day standard + interaction LMMs ------------------------------
 
 sameday_chem_rows   <- list()
+sameday_treat_rows  <- list()
 sameday_int_rows    <- list()
 sameday_slopes_rows <- list()
 
@@ -1172,6 +1174,9 @@ for (file_nm in names(chem_files)) {
       if (!is.null(main_res) && nrow(main_res$chem) > 0)
         sameday_chem_rows[[length(sameday_chem_rows) + 1L]] <-
           bind_cols(meta, main_res$chem)
+      if (!is.null(main_res) && nrow(main_res$treatment) > 0)
+        sameday_treat_rows[[length(sameday_treat_rows) + 1L]] <-
+          bind_cols(meta, main_res$treatment)
       if (!is.null(int_res)) {
         if (!is.null(int_res$interaction) && nrow(int_res$interaction) > 0)
           sameday_int_rows[[length(sameday_int_rows) + 1L]] <-
@@ -1193,6 +1198,10 @@ sameday_int    <- bind_rows(sameday_int_rows) %>%
   mutate(p.fdr = p.adjust(p.value, method = "BH")) %>%
   ungroup()
 sameday_slopes <- bind_rows(sameday_slopes_rows)
+sameday_treat  <- bind_rows(sameday_treat_rows) %>%
+  group_by(response) %>%
+  mutate(p.fdr = p.adjust(p.value, method = "BH")) %>%
+  ungroup()
 
 # ---- 13b-bis. Empirical justification for same-day AR correction ------------
 # Tests whether the same-day standard LMM residuals retain temporal
@@ -1547,6 +1556,8 @@ write_csv(sameday_coverage,
           file.path(SUPP_TABLES, "sameday_coverage.csv"))
 write_csv(sameday_chem,
           file.path(SUPP_TABLES, "sameday_results_chemistry.csv"))
+write_csv(sameday_treat,
+          file.path(SUPP_TABLES, "sameday_results_treatment.csv"))
 write_csv(sameday_int,
           file.path(SUPP_TABLES, "sameday_results_interaction.csv"))
 write_csv(sameday_slopes,
@@ -1641,7 +1652,7 @@ t2_data <- results_chem %>%
     Response       = recode(response, !!!response_labels),
     Predictor      = paste0(compound, " [", file, "]"),
     "\u03b2 (std)" = format_est(estimate, 3),
-    `"95% CI`       = format_ci(conf.low, conf.high, 3),
+    `95% CI`        = format_ci(conf.low, conf.high, 3),
     "R\u00b2 (m)"  = format_est(r2_marginal, 3),
     n              = formatC(n_obs, format = "d"),
     `p-value`      = format_p(p.value),
@@ -1859,11 +1870,11 @@ uP_matched <- build_matched_df(cores, "uP", WINDOW_PRIMARY) %>%
   mutate(Treatment = factor(Treatment, levels = c("Control", "Warmed")))
 
 uP_slopes_ar <- results_autocor_slopes %>%
-  filter(compound == "uP", window == WINDOW_PRIMARY,
+  filter(file == "Cores", compound == "uP", window == WINDOW_PRIMARY,
          response %in% RESPONSES_MAIN)
 
 uP_int_ar <- results_autocor_int %>%
-  filter(compound == "uP", window == WINDOW_PRIMARY,
+  filter(file == "Cores", compound == "uP", window == WINDOW_PRIMARY,
          response %in% RESPONSES_MAIN)
 
 panel_meta <- tibble(
@@ -2359,7 +2370,8 @@ sameday_ar_collapse <- sameday_chem %>%
   ) %>%
   mutate(survives_AR = ar_p < 0.05,
          pct_attenuation =
-           100 * (abs(estimate) - abs(ar_estimate)) / abs(estimate),
+           ifelse(estimate == 0, NA_real_,
+                  100 * (abs(estimate) - abs(ar_estimate)) / abs(estimate)),
          label = paste0(compound, " [", file, "]\n",
                         recode(response, !!!response_labels)),
          survives_lab = factor(survives_AR,
@@ -2757,6 +2769,9 @@ message("\n=== SECTION 20: Random-slope robustness checks (uP) ===")
 uP_compound <- if ("uP" %in% names(cores)) "uP" else
                grep("^uP$|ubial P|microbial.?P",
                     names(cores), value = TRUE)[1]
+if (is.na(uP_compound))
+  stop("Cannot find microbial P column ('uP') in Cores. ",
+       "Check TRACE_Cores_clean.csv column names.")
 
 uP_windowed <- build_matched_df(cores, uP_compound, WINDOW_PRIMARY)
 if (!is.null(uP_windowed))
@@ -3066,12 +3081,12 @@ if (exists("treatment_on_chem_blocked") &&
            BlockF        = factor(paste0("Block ", Block)),
            compound_file = paste0(compound, "  [", file, "]"))
   
-  comp_order <- figS10B_df %>%
+  comp_order_s10b <- figS10B_df %>%
     group_by(compound_file) %>%
     summarise(m = mean(abs(pct_diff)), .groups = "drop") %>%
     arrange(m) %>% pull(compound_file)
   figS10B_df <- figS10B_df %>%
-    mutate(compound_file = factor(compound_file, levels = comp_order))
+    mutate(compound_file = factor(compound_file, levels = comp_order_s10b))
   
   pS10_B <- ggplot(figS10B_df,
                    aes(x = pct_diff, y = compound_file, colour = BlockF)) +
