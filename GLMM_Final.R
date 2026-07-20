@@ -10,24 +10,23 @@
 #   CLIMATE.csv    monthly cwd, prec, binary Dry/Wet season
 #   Date filter:   >= 2018-09-01 applied to both pipelines.
 #
-# MODELS  (all four share the random structure; REML; nlminb default optimiser,
-#          with a BFGS + contr.sum rescue tier retained as a fallback)
+# MODELS  (all share the random structure; Gaussian REML; nlminb optimiser,
+#          with dispersed-start retries if the Hessian is not certified)
 #
 #   Temperature   temp_mean ~ Treatment * Year_f + season
 #                          + (1|Plot) + ar1(time_ou + 0 | Plot_Year)
-#                 dispformula = ~ Treatment + season
+#                 dispformula = ~ 1
 #
 #   VWC           vwc_pct ~ Treatment * Year_f + season
 #                        + (1|Plot) + ar1(time_ou + 0 | Plot_Year)
-#                 dispformula = ~ Treatment + season       (pdHess caveat possible)
-#                 vwc_pct = vwc_mean * 100
+#                 dispformula = ~ 1; vwc_pct = vwc_mean * 100
 #
 #   Flux          log_flux ~ Treatment * Year_f + Treatment * season
 #                         + (1|Plot) + ar1(time_ou + 0 | Plot_Year)
-#                 dispformula = ~ Treatment + season
+#                 dispformula = ~ 1
 #
-#   Mechanistic   log_flux ~ Treatment + Treatment:temp_mean
-#                         + Treatment:vwc_mean + Treatment:I(vwc_mean^2)
+#   Mechanistic   log_flux ~ Treatment + Year_f + season + temp_c + vwc_c
+#                         + I(vwc_c^2) + Treatment:(temp_c + vwc_c + I(vwc_c^2))
 #                         + (1|Plot) + ar1(time_ou + 0 | Plot_Year)
 #                 dispformula = ~ 1
 #
@@ -50,17 +49,10 @@
 #   treatment mean structure that the dispformula otherwise models in the
 #   variance.
 #
-#   Default nlminb optimiser converged with positive-definite Hessian for all 
-#   four models on the locked specification. A BFGS rescue tier under 
-#   sum-to-zero coding is retained in the script as a fallback for future runs 
-#   where nlminb may fail (this had been required during diagnostic development 
-#   under earlier random-effect specifications).
-#
-#   contr.sum coding (Treatment, Year_f, season) is applied ONLY inside the
-#   BFGS rescue tier. Because the standard tier converged on the locked
-#   specification, the reported fits use default treatment contrasts;
-#   downstream extractors detect the coding from coefficient names and
-#   transform SD ratios / slopes accordingly, so outputs are coding-invariant.
+#   Default nlminb is used for all fits. If it returns a finite fit with a
+#   non-positive-definite Hessian, the script retries from dispersed random-
+#   effect starts; all reported coefficient extractors assume the documented
+#   default treatment coding.
 #
 # CONTRASTS
 #   adjust = "none" (unadjusted p-values; comparison count stated in methods)
@@ -95,7 +87,8 @@ suppressPackageStartupMessages({
 set.seed(42)
 
 # ---------------------------- configuration ---------------------------------
-setwd("D:/USDA/TRACE_DM_APR_26/CO2")
+# Run from the repository/project directory; do not override the caller's working
+# directory with a machine-specific path.
 tv_path     <- "T_VWC.csv"
 flux_path   <- "FLUX.csv"
 clim_path   <- "CLIMATE.csv"
@@ -112,15 +105,7 @@ dir.create(out_dir,                          recursive = TRUE, showWarnings = FA
 dir.create(file.path(out_dir, "tables"),     showWarnings = FALSE)
 dir.create(file.path(out_dir, "objects"),    showWarnings = FALSE)
 
-# BFGS + contr.sum rescue control. On the locked specification nlminb (the
-# default optimiser, defined below) converges cleanly for all four models,
-# so this tier is a fallback only; it had been required under earlier
-# random-effect structures explored during development.
-ctrl_bfgs <- glmmTMBControl(
-  optimizer = optim,
-  optArgs   = list(method = "BFGS"),
-  optCtrl   = list(maxit = 2000)
-)
+# Optimiser controls for the default nlminb fit.
 ctrl_default <- glmmTMBControl(optCtrl = list(iter.max = 2000, eval.max = 2000))
 
 # ----------------------------- helpers --------------------------------------
@@ -164,89 +149,55 @@ extract_random_summary <- function(model) {
   out
 }
 
-# contr.sum coding (required for VWC primary convergence; applied uniformly).
-apply_contr_sum <- function(data, vars = c("Treatment", "Year_f", "season")) {
-  out <- data
-  for (v in vars) {
-    if (v %in% names(out) && is.factor(out[[v]]) && nlevels(out[[v]]) > 1) {
-      contrasts(out[[v]]) <- contr.sum(nlevels(out[[v]]))
-    }
-  }
-  out
-}
-
-# Fit with dispersed-start retry. Tier 1: default start. Tier 2: if the default
-# start does not yield a positive-definite Hessian, refit from dispersed starts
-# (all theta perturbed) until pdHess=TRUE, up to MAX_RETRY. This replaces the
-# earlier BFGS/contr.sum rescue: under dispformula ~1 the contr.sum recoding is
-# unnecessary, and the high-phi flat-surface false convergence is resolved by
-# reaching the (reproducible) optimum from a different start. Estimates from a
-# retried fit are identical to the reference optimum (verified in diagnostics);
-# only the Hessian certification differs.
+# Fit with dispersed-start retry. The retry is seeded from a finite, but
+# uncertified, default fit and perturbs only the random-effect parameters.
 fit_with_rescue <- function(formula, dispformula, data, label) {
   fit_std <- tryCatch(glmmTMB(
     formula = formula, dispformula = dispformula,
-    data    = data,    family      = gaussian(),
-    REML    = TRUE,    control     = ctrl_default
+    data = data, family = gaussian(), REML = TRUE, control = ctrl_default
   ), error = function(e) e)
 
   if (!is_failed_glmm(fit_std) && is_pdHess(fit_std)) {
     return(list(fit = fit_std, tactic = "standard"))
   }
-  seed_ok <- !inherits(fit_std, "error") &&
-    inherits(fit_std, "glmmTMB") &&
+  seed_ok <- inherits(fit_std, "glmmTMB") &&
     !is.null(tryCatch(getME(fit_std, "theta"), error = function(e) NULL))
-  if (seed_ok) {
-    th0 <- getME(fit_std, "theta"); be0 <- fixef(fit_std)$cond; bd0 <- fixef(fit_std)$disp
-  } else {
+  if (!seed_ok) {
     return(list(fit = NULL, tactic = "FAILED (no usable fit to seed retry)"))
   }
-  np <- length(th0)
+
+  th0 <- getME(fit_std, "theta")
+  be0 <- fixef(fit_std)$cond
+  bd0 <- fixef(fit_std)$disp
   set.seed(101)
   for (i in seq_len(MAX_RETRY)) {
-    st <- list(beta = be0, betadisp = bd0, theta = th0 + rnorm(np, 0, 0.5))
+    st <- list(beta = be0, betadisp = bd0,
+               theta = th0 + rnorm(length(th0), 0, 0.5))
     fit_r <- tryCatch(glmmTMB(
       formula = formula, dispformula = dispformula,
       data = data, family = gaussian(), REML = TRUE,
-      start = st, control = ctrl_default), error = function(e) e)
-    if (!inherits(fit_r, "error") && is_pdHess(fit_r)) {
-      return(list(fit = fit_r, tactic = sprintf("dispersed start %d", i)))
-    }
-  }
-  list(fit = fit_std, tactic = sprintf("standard (pdHess caveat; %d retries exhausted)", MAX_RETRY))
-
-  # dispersed-start retry from the (uncertified) default fit's parameters
-  th0 <- tryCatch(getME(fit_std, "theta"), error = function(e) NULL)
-  be0 <- tryCatch(fixef(fit_std)$cond,     error = function(e) NULL)
-  bd0 <- tryCatch(fixef(fit_std)$disp,     error = function(e) NULL)
-  if (is.null(th0) || is.null(be0)) {
-    return(list(fit = fit_std, tactic = "standard (pdHess caveat; retry unavailable)"))
-  }
-  np <- length(th0)
-  set.seed(101)
-  for (i in seq_len(MAX_RETRY)) {
-    st <- list(beta = be0, betadisp = bd0, theta = th0 + rnorm(np, 0, 0.5))
-    fit_r <- tryCatch(glmmTMB(
-      formula = formula, dispformula = dispformula,
-      data    = data,    family      = gaussian(),
-      REML    = TRUE,     start       = st, control = ctrl_default
+      start = st, control = ctrl_default
     ), error = function(e) e)
     if (!is_failed_glmm(fit_r) && is_pdHess(fit_r)) {
       return(list(fit = fit_r, tactic = sprintf("dispersed start %d", i)))
     }
   }
-  # no certified fit found: return the default (uncertified) with caveat
-  list(fit = fit_std, tactic = sprintf("standard (pdHess caveat; %d retries exhausted)", MAX_RETRY))
+  list(fit = fit_std,
+       tactic = sprintf("standard (pdHess caveat; %d retries exhausted)", MAX_RETRY))
 }
 
 # Per-cell sample sizes (n_control, n_warmed, n_min) used for empty-cell
 # flagging in per-(Year x season) contrast tables.
 build_cell_n <- function(data, by_vars = c("Year_f", "season")) {
+  # Complete treatment levels before widening so a missing arm is reported as
+  # zero rather than causing n_control/n_warmed to be absent.
   data %>%
     count(across(all_of(by_vars)), Treatment, name = "n_obs") %>%
+    tidyr::complete(!!!rlang::syms(by_vars), Treatment,
+                    fill = list(n_obs = 0L)) %>%
     pivot_wider(names_from = Treatment, values_from = n_obs,
                 values_fill = 0L, names_prefix = "n_") %>%
-    mutate(n_min = pmin(n_control, n_warmed, na.rm = TRUE))
+    mutate(n_min = pmin(n_control, n_warmed))
 }
 
 # Unadjusted-p contrast extraction. If cell_n + by-keys provided, joins
@@ -261,10 +212,28 @@ extract_contrast <- function(model, specs, cell_n = NULL, by_keys = NULL) {
     error = function(e) tibble(status = paste0("emmeans failed: ", e$message))
   )
   if ("status" %in% names(ct)) return(ct)
-  if (!is.null(cell_n) && !is.null(by_keys)) {
+  required_cols <- c("contrast", "estimate", "SE", "lower.CL", "upper.CL", "p.value")
+  missing_cols <- setdiff(required_cols, names(ct))
+  if (length(missing_cols) > 0L) {
+    return(tibble(status = paste0("emmeans output missing columns: ",
+                                  paste(missing_cols, collapse = ", "))))
+  }
+  if (xor(is.null(cell_n), is.null(by_keys))) {
+    return(tibble(status = "cell_n and by_keys must be supplied together"))
+  }
+  if (!is.null(cell_n)) {
+    missing_ct_keys <- setdiff(by_keys, names(ct))
+    missing_n_keys <- setdiff(by_keys, names(cell_n))
+    if (length(missing_ct_keys) > 0L || length(missing_n_keys) > 0L ||
+        !"n_min" %in% names(cell_n)) {
+      return(tibble(status = "contrast coverage join is missing required keys"))
+    }
+    ct <- left_join(ct, cell_n, by = by_keys)
+    if (anyNA(ct$n_min)) {
+      return(tibble(status = "contrast coverage join did not match every contrast"))
+    }
     ct <- ct %>%
-      left_join(cell_n, by = by_keys) %>%
-      mutate(empty_cell = is.na(n_min) | n_min <= EMPTY_CELL_THRESHOLD,
+      mutate(empty_cell = n_min <= EMPTY_CELL_THRESHOLD,
              notes = if_else(empty_cell, "[empty/low-info cell]", ""))
   }
   ct
@@ -284,11 +253,14 @@ derive_q10 <- function(model) {
     return(tibble(treatment = c("control","warmed"),
                   slope = NA, SE = NA, Q10 = NA, Q10_lo = NA, Q10_hi = NA,
                   status = "temp_c not found"))
-  has_i <- nm_i %in% names(fe)
-  b_m <- fe[nm_m]; b_i <- if (has_i) fe[nm_i] else 0
+  if (!nm_i %in% names(fe))
+    return(tibble(treatment = c("control", "warmed"),
+                  slope = NA, SE = NA, Q10 = NA, Q10_lo = NA, Q10_hi = NA,
+                  status = "treatment-specific temperature slope not found"))
+  b_m <- fe[nm_m]; b_i <- fe[nm_i]
   slope_c <- as.numeric(b_m); slope_w <- as.numeric(b_m + b_i)
   s_c <- sqrt(ve[nm_m, nm_m])
-  s_w <- if (has_i) sqrt(max(ve[nm_m,nm_m] + ve[nm_i,nm_i] + 2*ve[nm_m,nm_i], 0)) else s_c
+  s_w <- sqrt(max(ve[nm_m,nm_m] + ve[nm_i,nm_i] + 2*ve[nm_m,nm_i], 0))
   tibble(
     treatment = c("control", "warmed"),
     slope     = c(slope_c, slope_w),
@@ -509,6 +481,17 @@ d_analysis <- augment_for_glmm(d_tv) %>%
   mutate(vwc_pct = vwc_mean * 100)   # VWC scaled for numerical stability
 d_flux     <- augment_for_glmm(d_fl)
 
+validate_analysis_frame <- function(data, label) {
+  if (nrow(data) == 0L) stop(label, " has no eligible plot-days after filtering.")
+  if (n_distinct(data$Plot) < 2L) stop(label, " has fewer than two plots.")
+  if (!all(c("control", "warmed") %in% as.character(unique(data$Treatment)))) {
+    stop(label, " must contain both control and warmed observations.")
+  }
+  invisible(data)
+}
+validate_analysis_frame(d_analysis, "Temp/VWC analysis data")
+validate_analysis_frame(d_flux, "Flux analysis data")
+
 # Grand-mean centring constants for the mechanistic covariates (computed on the
 # flux analysis frame, the data the mechanistic models are fitted to). Retained
 # so derived quantities can be back-transformed to real units:
@@ -536,6 +519,10 @@ coverage_fl_year <- d_flux %>%
 
 cell_n_tv <- build_cell_n(d_analysis)
 cell_n_fl <- build_cell_n(d_flux)
+cell_n_tv_year <- build_cell_n(d_analysis, "Year_f")
+cell_n_fl_year <- build_cell_n(d_flux, "Year_f")
+cell_n_tv_season <- build_cell_n(d_analysis, "season")
+cell_n_fl_season <- build_cell_n(d_flux, "season")
 
 write_csv(coverage_tv_year_season,
           file.path(out_dir, "tables", "coverage_tv_year_season.csv"))
@@ -547,6 +534,10 @@ write_csv(coverage_fl_year,
           file.path(out_dir, "tables", "coverage_flux_year.csv"))
 write_csv(cell_n_tv, file.path(out_dir, "tables", "cell_n_tv.csv"))
 write_csv(cell_n_fl, file.path(out_dir, "tables", "cell_n_flux.csv"))
+write_csv(cell_n_tv_year, file.path(out_dir, "tables", "cell_n_tv_year.csv"))
+write_csv(cell_n_fl_year, file.path(out_dir, "tables", "cell_n_flux_year.csv"))
+write_csv(cell_n_tv_season, file.path(out_dir, "tables", "cell_n_tv_season.csv"))
+write_csv(cell_n_fl_season, file.path(out_dir, "tables", "cell_n_flux_season.csv"))
 
 # ============================================================================
 # 5. MODEL FITTING
@@ -571,7 +562,7 @@ temp_pooled_res <- fit_with_rescue(
   dispformula = ~ 1, data = d_analysis, label = "temp_pooled")
 cat("    temperature (interaction) ...\n")
 temp_inter_res <- fit_with_rescue(
-  formula     = as.formula(paste("temp_mean ~ Treatment * Year_f + Treatment * season +", rs_term)),
+  formula     = as.formula(paste("temp_mean ~ Treatment * Year_f + season +", rs_term)),
   dispformula = ~ 1, data = d_analysis, label = "temp_inter")
 
 # --- VWC ---
@@ -581,7 +572,7 @@ vwc_pooled_res <- fit_with_rescue(
   dispformula = ~ 1, data = d_analysis, label = "vwc_pooled")
 cat("    VWC (interaction) ...\n")
 vwc_inter_res <- fit_with_rescue(
-  formula     = as.formula(paste("vwc_pct ~ Treatment * Year_f + Treatment * season +", rs_term)),
+  formula     = as.formula(paste("vwc_pct ~ Treatment * Year_f + season +", rs_term)),
   dispformula = ~ 1, data = d_analysis, label = "vwc_inter")
 
 # --- Flux ---
@@ -620,12 +611,16 @@ flux_marg <- extract_contrast(flux_pooled_res$fit, ~ Treatment)
 
 # Per-Year and per-season warmed - control: from the INTERACTION models
 # (the year- and season-resolved effects the interactions exist to estimate).
-temp_by_year   <- extract_contrast(temp_inter_res$fit, ~ Treatment | Year_f)
-vwc_by_year    <- extract_contrast(vwc_inter_res$fit,  ~ Treatment | Year_f)
-flux_by_year   <- extract_contrast(flux_inter_res$fit, ~ Treatment | Year_f)
-temp_by_season <- extract_contrast(temp_inter_res$fit, ~ Treatment | season)
-vwc_by_season  <- extract_contrast(vwc_inter_res$fit,  ~ Treatment | season)
-flux_by_season <- extract_contrast(flux_inter_res$fit, ~ Treatment | season)
+temp_by_year <- extract_contrast(temp_inter_res$fit, ~ Treatment | Year_f,
+                                 cell_n_tv_year, "Year_f")
+vwc_by_year <- extract_contrast(vwc_inter_res$fit, ~ Treatment | Year_f,
+                                cell_n_tv_year, "Year_f")
+flux_by_year <- extract_contrast(flux_inter_res$fit, ~ Treatment | Year_f,
+                                 cell_n_fl_year, "Year_f")
+# Temperature and VWC do not include Treatment:season, so no model-derived
+# treatment-by-season contrasts are reported for those responses.
+flux_by_season <- extract_contrast(flux_inter_res$fit, ~ Treatment | season,
+                                   cell_n_fl_season, "season")
 
 # Write contrast tables.
 write_csv(temp_marg,      file.path(out_dir, "tables", "contrast_temp_marginal.csv"))
@@ -634,8 +629,6 @@ write_csv(flux_marg,      file.path(out_dir, "tables", "contrast_flux_marginal.c
 write_csv(temp_by_year,   file.path(out_dir, "tables", "contrast_temp_by_year.csv"))
 write_csv(vwc_by_year,    file.path(out_dir, "tables", "contrast_vwc_by_year.csv"))
 write_csv(flux_by_year,   file.path(out_dir, "tables", "contrast_flux_by_year.csv"))
-write_csv(temp_by_season, file.path(out_dir, "tables", "contrast_temp_by_season.csv"))
-write_csv(vwc_by_season,  file.path(out_dir, "tables", "contrast_vwc_by_season.csv"))
 write_csv(flux_by_season, file.path(out_dir, "tables", "contrast_flux_by_season.csv"))
 
 # ============================================================================
@@ -651,7 +644,7 @@ vwc_opt_tbl <- derive_vwc_optimum(mech_mod_res$fit, VWC_CENTRE)
 
 # Mechanistic residual warming effect (warming effect after temperature and
 # moisture are accounted for, common slopes) comes from the PATHWAY model's
-# Treatment marginal. On log_flux, so back-transform to a ratio.
+# Treatment marginal. On log_flux, so exp(contrast) is a geometric-mean ratio.
 mech_marg   <- extract_contrast(mech_path_res$fit, ~ Treatment)
 if (!"status" %in% names(mech_marg)) {
   mech_marg <- mech_marg %>%
@@ -735,7 +728,9 @@ derive_vwc_opt_contrast <- function(model) {
   )
 }
 
-# Empirical-SD variability: per-cell SD modelled on the log scale.
+# Exploratory empirical-SD variability. The finite-sample expectation of log(S)
+# depends on n_days; correct that bias before comparing cells. This does not
+# remove uncertainty from estimating each cell SD, so results remain descriptive.
 empirical_sd_variability <- function(data, response, label, MIN_CELL_N = 5L) {
   cells <- data %>%
     group_by(Plot, Treatment, Year_f, season) %>%
@@ -744,7 +739,9 @@ empirical_sd_variability <- function(data, response, label, MIN_CELL_N = 5L) {
     filter(n_days >= MIN_CELL_N, is.finite(cell_sd), cell_sd > 0)
   if (nrow(cells) < 4 || n_distinct(cells$Treatment) < 2)
     return(tibble(model = label, status = "insufficient cells"))
-  cells <- cells %>% mutate(log_sd = log(cell_sd))
+  cells <- cells %>%
+    mutate(log_sd_bias = 0.5 * (digamma((n_days - 1) / 2) + log(2) - log(n_days - 1)),
+           log_sd = log(cell_sd) - log_sd_bias)
   m <- tryCatch(glmmTMB(log_sd ~ Treatment + season + (1 | Plot),
                         data = cells, family = gaussian(), REML = TRUE,
                         control = ctrl_default), error = function(e) e)
@@ -823,8 +820,6 @@ cat(">>> Writing report ...\n")
 n_yr_temp <- if (!"status" %in% names(temp_by_year))   nrow(temp_by_year)   else 0L
 n_yr_vwc  <- if (!"status" %in% names(vwc_by_year))    nrow(vwc_by_year)    else 0L
 n_yr_flux <- if (!"status" %in% names(flux_by_year))   nrow(flux_by_year)   else 0L
-n_se_temp <- if (!"status" %in% names(temp_by_season)) nrow(temp_by_season) else 0L
-n_se_vwc  <- if (!"status" %in% names(vwc_by_season))  nrow(vwc_by_season)  else 0L
 n_se_flux <- if (!"status" %in% names(flux_by_season)) nrow(flux_by_season) else 0L
 
 rule <- function(c = "=", n = 75) strrep(c, n)
@@ -909,7 +904,7 @@ add(rule("-"),
     "TEMPERATURE (response = temp_mean, deg C)",
     rule("-"),
     "  Pooled:      temp_mean ~ Treatment + Year_f + season",
-    "  Interaction: temp_mean ~ Treatment * Year_f + Treatment * season",
+    "  Interaction: temp_mean ~ Treatment * Year_f + season",
     "               + (1|Plot) + ar1(time_ou + 0 | Plot_Year); dispformula = ~ 1",
     "")
 add("  [Pooled model - overall long-term effect]")
@@ -921,14 +916,12 @@ add(fit_block(temp_inter_res, "temp_inter"))
 add(sprintf("  Per-year warmed - control (%d comparisons; p unadjusted):", n_yr_temp))
 add(contrast_to_text(temp_by_year, group_col = "Year_f",
                      value_label = "deg C", show_n = FALSE))
-add(sprintf("  Per-season warmed - control (%d comparisons; p unadjusted):", n_se_temp))
-add(contrast_to_text(temp_by_season, group_col = "season", value_label = "deg C"))
 
 add(rule("-"),
     "VWC (response = vwc_pct = vwc_mean * 100, percent)",
     rule("-"),
     "  Pooled:      vwc_pct ~ Treatment + Year_f + season",
-    "  Interaction: vwc_pct ~ Treatment * Year_f + Treatment * season",
+    "  Interaction: vwc_pct ~ Treatment * Year_f + season",
     "               + (1|Plot) + ar1(time_ou + 0 | Plot_Year); dispformula = ~ 1",
     "",
     "  Note: VWC scaled to percent for numerical stability. Divide by 100",
@@ -943,8 +936,6 @@ add(fit_block(vwc_inter_res, "vwc_inter"))
 add(sprintf("  Per-year warmed - control (vwc_pct; %d comparisons; p unadjusted):", n_yr_vwc))
 add(contrast_to_text(vwc_by_year, group_col = "Year_f",
                      value_label = "vwc_pct"))
-add(sprintf("  Per-season warmed - control (vwc_pct; %d comparisons; p unadjusted):", n_se_vwc))
-add(contrast_to_text(vwc_by_season, group_col = "season", value_label = "vwc_pct"))
 
 add(rule("-"),
     "FLUX (response = log_flux)",
@@ -960,7 +951,7 @@ add(fit_block(flux_pooled_res, "flux_pooled"))
 add("  [Interaction model - year/season resolution]")
 add(fit_block(flux_inter_res, "flux_inter"))
 
-# Flux contrasts: report log-scale and back-transformed ratio.
+# Flux contrasts: report log-scale and geometric-mean ratios.
 add_flux_contrast <- function(ct, group_col, value_label) {
   if ("status" %in% names(ct)) {
     add(paste0("  [", paste(ct$status, collapse = "; "), "]\n"))
@@ -972,7 +963,7 @@ add_flux_contrast <- function(ct, group_col, value_label) {
            ratio_hi    = exp(upper.CL))
   add("  Log-scale contrasts (warmed - control on log_flux):")
   add(contrast_to_text(ct, group_col = group_col, value_label = value_label))
-  add("  Back-transformed ratios (warmed / control):")
+  add("  Back-transformed geometric-mean ratios (warmed / control):")
   if (is.null(group_col)) {
     add(sprintf("    ratio = %s   95%% CI [%s, %s]",
                 fmt(ct2$ratio_w_c, 3), fmt(ct2$ratio_lo, 3),
@@ -1012,16 +1003,20 @@ add(fit_block(mech_mod_res, "mech_modification"))
 
 # Q10 results
 add("  Q10 by treatment (Q10 = exp(10 * slope) of log_flux on temperature):")
-add(sprintf("  %-10s %10s %10s %10s %10s",
-            "treatment", "slope", "Q10", "Q10_lo", "Q10_hi"))
-add(paste0("  ", strrep("-", 55)))
-for (i in seq_len(nrow(q10_tbl))) {
+if ("status" %in% names(q10_tbl)) {
+  add(paste0("  [", paste(unique(q10_tbl$status), collapse = "; "), "]"))
+} else {
   add(sprintf("  %-10s %10s %10s %10s %10s",
-              q10_tbl$treatment[i],
-              fmt(q10_tbl$slope[i],  5),
-              fmt(q10_tbl$Q10[i],    3),
-              fmt(q10_tbl$Q10_lo[i], 3),
-              fmt(q10_tbl$Q10_hi[i], 3)))
+              "treatment", "slope", "Q10", "Q10_lo", "Q10_hi"))
+  add(paste0("  ", strrep("-", 55)))
+  for (i in seq_len(nrow(q10_tbl))) {
+    add(sprintf("  %-10s %10s %10s %10s %10s",
+                q10_tbl$treatment[i],
+                fmt(q10_tbl$slope[i],  5),
+                fmt(q10_tbl$Q10[i],    3),
+                fmt(q10_tbl$Q10_lo[i], 3),
+                fmt(q10_tbl$Q10_hi[i], 3)))
+  }
 }
 add("")
 
@@ -1042,7 +1037,8 @@ add("")
 
 # Mechanistic residual (from PATHWAY model: warming effect after T+VWC absorbed)
 add("  Residual warmed-control on log_flux, from PATHWAY model",
-    "  (warming effect after temperature and moisture absorbed, common slopes):")
+    "  (warming effect after temperature and moisture absorbed, common slopes;",
+    "  exp(contrast) is a geometric-mean ratio):")
 if (!"status" %in% names(mech_marg)) {
   add(sprintf("    estimate = %s   SE = %s   95%% CI [%s, %s]   p = %s",
               fmt(mech_marg$estimate[1]),  fmt(mech_marg$SE[1]),
@@ -1089,10 +1085,12 @@ add("")
 
 # Variability (empirical per-cell SD; model-independent)
 add(rule("-"),
-    "TREATMENT EFFECT ON VARIABILITY (EMPIRICAL PER-CELL SD)",
+    "EXPLORATORY TREATMENT EFFECT ON VARIABILITY (EMPIRICAL PER-CELL SD)",
     rule("-"),
     "  Per-(Plot x Year x season) SD of the response (scatter around each",
-    "  cell mean), modelled as log(SD) ~ Treatment + season + (1|Plot).",
+    "  cell mean), with a finite-sample log-SD bias correction, then modelled",
+    "  as log(SD) ~ Treatment + season + (1|Plot). This is exploratory because",
+    "  cell-SD estimation uncertainty and temporal dependence are not modelled.",
     "  SD_ratio = exp(Treatment coef) = warmed/control SD ratio (adjusted).",
     "  raw_gm_SD_ratio = unadjusted geometric-mean SD ratio. Model-independent",
     "  (does not use the GLMM dispersion structure).",
@@ -1155,18 +1153,12 @@ add(rule("-"),
     "  and treatment mean structure that the dispformula otherwise models",
     "  in the variance.",
     "",
-    "  Optimisation: the default nlminb optimiser converged with a positive-",
-    "  definite Hessian for all four models on the locked specification, so the",
-    "  reported fits use nlminb with default treatment contrasts. A BFGS-via-",
-    "  optim rescue tier under sum-to-zero (contr.sum) coding is retained as an",
-    "  automatic fallback; it was required under earlier random-effect",
-    "  specifications during development but does not fire on the final spec.",
-    "  Each fit block reports the tactic actually used.",
-    "",
-    "  Coefficient coding: downstream extractors (dispformula SD ratios, Q10",
-    "  and VWC-optimum derivations) detect the contrast coding from coefficient",
-    "  names and apply the matching transform, so reported quantities are",
-    "  coding-invariant whether a model used the standard or rescue tier.",
+    "  Optimisation: a positive-definite Hessian is required for a certified",
+    "  fit. If the standard nlminb fit is finite but has a non-positive-",
+    "  nlminb fit is finite but has a non-positive-definite Hessian, the script",
+    "  retries from dispersed random-effect starting values. Each fit block",
+    "  reports the tactic actually used; an uncertified fit is explicitly",
+    "  flagged and its standard errors should not be used for inference.",
     "",
     "  Q10 derivation: Treatment-specific temperature slopes from the",
     "  mechanistic model give Q10 = exp(10 * slope) per treatment. 95% CIs",
@@ -1196,7 +1188,11 @@ saveRDS(
       tv_year          = coverage_tv_year,
       fl_year          = coverage_fl_year,
       cell_n_tv        = cell_n_tv,
-      cell_n_fl        = cell_n_fl
+      cell_n_fl        = cell_n_fl,
+      cell_n_tv_year   = cell_n_tv_year,
+      cell_n_fl_year   = cell_n_fl_year,
+      cell_n_tv_season = cell_n_tv_season,
+      cell_n_fl_season = cell_n_fl_season
     ),
     fits = list(
       temp_pooled = temp_pooled_res,
@@ -1216,8 +1212,6 @@ saveRDS(
       temp_by_year   = temp_by_year,
       vwc_by_year    = vwc_by_year,
       flux_by_year   = flux_by_year,
-      temp_by_season = temp_by_season,
-      vwc_by_season  = vwc_by_season,
       flux_by_season = flux_by_season
     ),
     derived = list(
