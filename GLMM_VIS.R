@@ -151,18 +151,19 @@ save_fig(fig1, "Figure1_TreatmentSeason", width = 6, height = 12)
 # ============================================================================
 # MAIN FIGURE 2: Year-resolved warming effect (from interaction-model contrasts)
 # ============================================================================
-cy_flux <- read_safe(file.path(tab_dir, "contrast_flux_by_year.csv")) %>%
-  mutate(Year_f               = factor(Year_f),
-         ratio_warmed_control = exp(estimate),
-         ratio_lower          = exp(lower.CL),
-         ratio_upper          = exp(upper.CL))
-cy_temp <- read_safe(file.path(tab_dir, "contrast_temp_by_year.csv")) %>%
-  mutate(Year_f = factor(Year_f))
-cy_vwc  <- read_safe(file.path(tab_dir, "contrast_vwc_by_year.csv")) %>%
-  mutate(Year_f   = factor(Year_f),
-         estimate = estimate / 100,
-         lower.CL = lower.CL / 100,
-         upper.CL = upper.CL / 100)
+valid_contrast <- function(x, required = c("Year_f", "estimate", "lower.CL", "upper.CL")) {
+  !is.null(x) && !"status" %in% names(x) && all(required %in% names(x))
+}
+cy_flux <- read_safe(file.path(tab_dir, "contrast_flux_by_year.csv"))
+cy_temp <- read_safe(file.path(tab_dir, "contrast_temp_by_year.csv"))
+cy_vwc  <- read_safe(file.path(tab_dir, "contrast_vwc_by_year.csv"))
+if (valid_contrast(cy_flux)) cy_flux <- cy_flux %>%
+  mutate(Year_f = factor(Year_f), ratio_warmed_control = exp(estimate),
+         ratio_lower = exp(lower.CL), ratio_upper = exp(upper.CL))
+if (valid_contrast(cy_temp)) cy_temp <- cy_temp %>% mutate(Year_f = factor(Year_f))
+if (valid_contrast(cy_vwc)) cy_vwc <- cy_vwc %>%
+  mutate(Year_f = factor(Year_f), estimate = estimate / 100,
+         lower.CL = lower.CL / 100, upper.CL = upper.CL / 100)
 
 forest_panel <- function(df, xval, xlo, xhi, ref, xlab, title, col) {
   ggplot(df, aes(x = .data[[xval]], y = Year_f)) +
@@ -174,6 +175,7 @@ forest_panel <- function(df, xval, xlo, xhi, ref, xlab, title, col) {
     labs(x = xlab, y = NULL, title = title) +
     theme_pub() + theme(legend.position = "none")
 }
+if (valid_contrast(cy_flux) && valid_contrast(cy_temp) && valid_contrast(cy_vwc)) {
 p2a <- forest_panel(cy_flux, "ratio_warmed_control", "ratio_lower", "ratio_upper",
                     ref = 1, xlab = "Warmed : control flux ratio",
                     title = "(A) CO2 flux", col = "#ca0020")
@@ -187,6 +189,9 @@ fig2 <- (p2a | p2b | p2c) +
   plot_annotation(title = "Year-resolved warming effects",
                   theme = theme(plot.title = element_text(face = "bold", size = 13)))
 save_fig(fig2, "Figure2_YearForest", width = 13, height = 5)
+} else {
+  warning("Year-resolved contrast output unavailable; Figure 2 was not created.")
+}
 
 # ============================================================================
 # MAIN FIGURE 2b: Season-resolved warming effect (from interaction contrasts)
@@ -229,33 +234,20 @@ if (!is.null(cs_flux) && !is.null(cs_temp) && !is.null(cs_vwc) &&
 }
 
 # ============================================================================
-# MAIN FIGURE 3: Apparent Q10 by treatment with Wood et al. (2025) reference
+# MAIN FIGURE 3: Apparent Q10 by treatment
 # ============================================================================
-q10_trt <- read_safe(file.path(tab_dir, "q10_by_treatment.csv")) %>%
-  rename(Treatment = treatment) %>%
-  mutate(study = "This study (Sep 2018+)")
-q10_wood <- tibble(
-  Treatment = c("control", "warmed"),
-  Q10       = c(2.51, 0.71),
-  Q10_lo    = pmax(0.05, c(2.51 - 1.23, 0.71 - 1.30)),
-  Q10_hi    = c(2.51 + 1.23, 0.71 + 1.30),
-  study     = "Wood et al. 2025 (year 1)"
-)
-if (!is.null(q10_trt)) {
+q10_trt <- read_safe(file.path(tab_dir, "q10_by_treatment.csv"))
+if (!is.null(q10_trt) && !"status" %in% names(q10_trt) &&
+    all(c("treatment", "Q10", "Q10_lo", "Q10_hi") %in% names(q10_trt))) {
+  q10_trt <- q10_trt %>% rename(Treatment = treatment)
   p3 <- ggplot(q10_trt, aes(x = Treatment, y = Q10, colour = Treatment)) +
     geom_hline(yintercept = 1, linetype = 3, colour = "grey50") +
     geom_errorbar(aes(ymin = Q10_lo, ymax = Q10_hi), width = 0.12, linewidth = 0.9) +
     geom_point(size = 4) +
     scale_colour_manual(values = trt_cols, guide = "none") +
-    geom_errorbar(data = q10_wood, aes(x = Treatment, ymin = Q10_lo, ymax = Q10_hi),
-                  width = 0.08, colour = "grey45", linewidth = 0.6,
-                  inherit.aes = FALSE, position = position_nudge(x = 0.18)) +
-    geom_point(data = q10_wood, aes(x = Treatment, y = Q10),
-               shape = 17, size = 3, colour = "grey45",
-               inherit.aes = FALSE, position = position_nudge(x = 0.18)) +
     labs(x = NULL, y = expression(Apparent~Q[10]),
          title    = "Apparent temperature sensitivity of soil respiration",
-         subtitle = "Circles: this study (multi-year, modification model). Triangles: Wood et al. 2025 year-one reference.") +
+         subtitle = "Multi-year estimates from the mechanistic modification model.") +
     theme_pub()
   save_fig(p3, "Figure3_Q10_by_treatment", width = 6, height = 6)
 }
@@ -291,7 +283,7 @@ p4 <- ggplot(surf_wide, aes(x = vwc_mean, y = temp_mean, fill = pct)) +
                        midpoint = 0, name = "% change") +
   labs(x = expression(Soil~VWC~(m^3~m^-3)), y = "Soil temperature (\u00B0C)",
        title    = "Warming effect on CO2 flux across the moisture-temperature domain",
-       subtitle = "Percent change (warmed vs control), from the mechanistic modification model") +
+       subtitle = "Percent change in model-estimated geometric-mean flux (warmed vs control), from the mechanistic modification model") +
   theme_pub() + theme(legend.position = "right")
 save_fig(p4, "Figure4_PercentChange_Surface", width = 8, height = 6)
 
@@ -308,6 +300,12 @@ if (file.exists("HURCN.csv")) {
     mutate(Start = as.Date(parse_date_time(Start, orders = c("dmy","mdy","ymd"))),
            End   = as.Date(parse_date_time(End,   orders = c("dmy","mdy","ymd")))) |>
     filter(!is.na(Start), !is.na(End))
+  data_start <- min(c(d_flux$Date, d_analysis$Date), na.rm = TRUE)
+  data_end   <- max(c(d_flux$Date, d_analysis$Date), na.rm = TRUE)
+  # Retain only events overlapping the observed data window and clip ranges so
+  # annotations cannot extend the time-series axis beyond the measurements.
+  hurcn <- hurcn |> filter(End >= data_start, Start <= data_end) |>
+    mutate(Start = pmax(Start, data_start), End = pmin(End, data_end))
   disturbances_ranges <- hurcn |> filter(Start != End)
   disturbances_points <- hurcn |> filter(Start == End)
 } else {
@@ -322,6 +320,8 @@ custom_breaks <- sort(as.Date(paste0(data_years, "-01-01")))
 
 create_delta_plot <- function(daily_data, var_name, y_lab, title_txt,
                               line_col, show_x = FALSE) {
+  # Daily treatment differences are shown descriptively. The ribbon is the
+  # same-day between-plot SE, not a model-based confidence interval.
   agg <- daily_data |>
     group_by(Date, Treatment) |>
     summarise(mean_val = mean(.data[[var_name]], na.rm = TRUE),
@@ -331,7 +331,8 @@ create_delta_plot <- function(daily_data, var_name, y_lab, title_txt,
     pivot_wider(names_from = Treatment, values_from = c(mean_val, se_val)) |>
     mutate(Delta     = mean_val_warmed - mean_val_control,
            Delta_SE  = sqrt(se_val_warmed^2 + se_val_control^2),
-           Delta_Min = Delta - Delta_SE, Delta_Max = Delta + Delta_SE) |>
+           Delta_Min = Delta - Delta_SE,
+           Delta_Max = Delta + Delta_SE) |>
     filter(is.finite(Delta), is.finite(Delta_SE)) |>
     arrange(Date)
 
@@ -364,7 +365,8 @@ f5b <- create_delta_plot(d_analysis, "temp_mean",
 f5c <- create_delta_plot(d_analysis, "vwc_mean",
         expression(Delta~VWC~(m^3~m^-3)),               "(C) Soil moisture",     "#E69F00",
         show_x = TRUE)
-fig5 <- f5a / f5b / f5c
+fig5 <- f5a / f5b / f5c +
+  plot_annotation(subtitle = "Descriptive daily warmed-minus-control differences; ribbons are same-day between-plot SEs, not model-based confidence intervals.")
 save_fig(fig5, "Figure5_DailyDelta", width = 12, height = 10)
 
 # ============================================================================
@@ -408,7 +410,7 @@ make_response_curve <- function(model, focal_c, focal_centre, focal_lab, title) 
     geom_line(linewidth = 1.1) +
     scale_colour_manual(values = trt_cols) + scale_fill_manual(values = trt_cols) +
     labs(x = focal_lab, y = expression(CO[2]~flux~(mu*mol~m^-2~s^-1)), title = title,
-         subtitle = "Modification model; other driver fixed at its mean") +
+         subtitle = "Model-estimated geometric-mean flux; other driver fixed at its mean") +
     theme_pub()
 }
 s1 <- (make_response_curve(m_mech, "vwc_c",  VWC_CENTRE, expression(Soil~VWC~(m^3~m^-3)),
@@ -533,18 +535,18 @@ edges <- tibble(
 p_s5 <- ggplot() +
   geom_segment(data = edges,
                aes(x = x, y = y, xend = xend, yend = yend, linetype = dashed),
-               arrow = arrow(length = unit(0.18, "cm"), type = "closed"),
+               arrow = arrow(length = grid::unit(0.18, "cm"), type = "closed"),
                linewidth = 0.6, colour = "grey25") +
   geom_label(data = edges, aes(x = lx, y = ly, label = lab),
              size = 3.2, label.size = 0, fill = "white") +
   geom_label(data = nodes, aes(x = x, y = y, label = label),
-             size = 4, fontface = "bold", label.padding = unit(0.4, "lines")) +
+             size = 4, fontface = "bold", label.padding = grid::unit(0.4, "lines")) +
   scale_linetype_manual(values = c("FALSE" = "solid", "TRUE" = "22"), guide = "none") +
   scale_x_continuous(limits = c(-0.25, 2.25)) +
   scale_y_continuous(limits = c(0, 1)) +
   labs(title    = "Descriptive pathways of the warming effect on CO2 flux",
        subtitle = paste0(lab_total,
-                         "; direct path is the mechanistic residual after T and VWC")) +
+                         "; conditional treatment association after T and VWC (not a causal direct effect). A causal mediation analysis would require randomized treatment, pre-treatment mediator--outcome confounder control, longitudinal mediator/outcome models, and sensitivity analysis for mediator--outcome confounding.")) +
   theme_void() +
   theme(plot.title    = element_text(face = "bold", size = 12),
         plot.subtitle = element_text(size = 9, colour = "grey30"),
@@ -554,32 +556,44 @@ save_fig(p_s5, "FigureS5_Mediation_Schematic", width = 9, height = 5)
 # ============================================================================
 # SUPPLEMENTARY S6: Per-plot Q10 (descriptive; computed on the fly)
 # ============================================================================
-q10_plot <- d_flux |>
-  group_by(Plot, Treatment) |>
-  group_modify(~ {
-    m  <- lm(log_flux ~ temp_mean, data = .x)
-    cf <- summary(m)$coefficients
-    b  <- cf[2, 1]; se <- cf[2, 2]
-    tibble(slope    = b,
-           Q10      = exp(10 * b),
-           Q10_lo   = exp(10 * (b - 1.96 * se)),
-           Q10_hi   = exp(10 * (b + 1.96 * se)),
-           n_days   = nrow(.x))
-  }) |>
-  ungroup() |>
-  mutate(Plot = factor(Plot))
-write_csv(q10_plot, file.path(tab_dir, "q10_per_plot_supplementary.csv"))
-
-p_s6 <- ggplot(q10_plot, aes(x = Plot, y = Q10, colour = Treatment)) +
-  geom_hline(yintercept = 1, linetype = 3, colour = "grey50") +
-  geom_errorbar(aes(ymin = Q10_lo, ymax = Q10_hi), width = 0.15, linewidth = 0.8) +
-  geom_point(size = 3) +
-  scale_colour_manual(values = trt_cols) +
-  labs(x = "Plot", y = expression(Apparent~Q[10]),
-       title    = "Per-plot apparent temperature sensitivity",
-       subtitle = "Descriptive per-plot log-flux on temperature; ignores autocorrelation") +
-  theme_pub()
-save_fig(p_s6, "FigureS6_Q10_perplot", width = 7, height = 5)
+# A descriptive partial-pooling model with plot-specific temperature slopes and
+# the same within-Plot-Year AR(1) structure used by the primary models.
+m_plot_q10 <- tryCatch(
+  glmmTMB(log_flux ~ Treatment + Year_f + season + temp_c + vwc_c + I(vwc_c^2) +
+            Treatment:temp_c + Treatment:vwc_c + Treatment:I(vwc_c^2) +
+            (1 + temp_c | Plot) + ar1(time_ou + 0 | Plot_Year),
+          dispformula = ~ 1, data = d_flux, REML = TRUE),
+  error = function(e) e)
+if (inherits(m_plot_q10, "glmmTMB") && isTRUE(m_plot_q10$sdr$pdHess)) {
+  fixed <- fixef(m_plot_q10)$cond
+  trt_temp_term <- grep("(^Treatmentwarmed:temp_c$|^temp_c:Treatmentwarmed$)",
+                        names(fixed), value = TRUE)
+  if (length(trt_temp_term) != 1L) {
+    stop("Could not identify the warmed-by-temperature fixed-effect term.")
+  }
+  plot_re <- ranef(m_plot_q10)$cond$Plot
+  slopes <- setNames(plot_re[, "temp_c"], rownames(plot_re))
+  plot_trt <- d_flux |> distinct(Plot, Treatment)
+  q10_plot <- plot_trt |>
+    mutate(fixed_slope = if_else(Treatment == "warmed",
+                                 fixed[["temp_c"]] + fixed[[trt_temp_term]],
+                                 fixed[["temp_c"]]),
+           slope = fixed_slope + slopes[as.character(Plot)],
+           Q10 = exp(10 * slope)) |>
+    filter(is.finite(Q10))
+  write_csv(q10_plot, file.path(tab_dir, "q10_per_plot_supplementary.csv"))
+  p_s6 <- ggplot(q10_plot, aes(x = factor(Plot), y = Q10, colour = Treatment)) +
+    geom_hline(yintercept = 1, linetype = 3, colour = "grey50") +
+    geom_point(size = 3) +
+    scale_colour_manual(values = trt_cols) +
+    labs(x = "Plot", y = expression(Apparent~Q[10]),
+         title = "Per-plot apparent temperature sensitivity",
+         subtitle = "Partial-pooling plot slopes from an AR(1)-aware hierarchical model; descriptive estimates, not plot-level hypothesis tests.") +
+    theme_pub()
+  save_fig(p_s6, "FigureS6_Q10_perplot", width = 7, height = 5)
+} else {
+  warning("The AR(1)-aware hierarchical per-plot Q10 model did not certify; Figure S6 was not created.")
+}
 
 # ============================================================================
 # SUPPLEMENTARY: Climate incident table figure (HURCN)
