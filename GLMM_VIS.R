@@ -335,7 +335,6 @@ create_delta_plot <- function(daily_data, var_name, y_lab, title_txt,
            Delta_Max = Delta + Delta_SE) |>
     filter(is.finite(Delta), is.finite(Delta_SE)) |>
     arrange(Date)
-
   seg <- segment_series(agg, date_col = "Date", y_col = "Delta", gap_days = 1)
 
   p <- ggplot() +
