@@ -175,35 +175,45 @@ q10_wood <- tibble(
   Q10_wood_sd = c(1.23, 1.30)
 )
 
-tab3 <- q10_tbl |>
-  left_join(q10_wood, by = "treatment") |>
-  left_join(vwc_opt |> select(treatment, optimum), by = "treatment") |>
-  transmute(
-    Treatment              = treatment,
-    `Q10 (this study)`     = fmt_n(Q10),
-    `Q10 95% CI`           = ci(Q10_lo, Q10_hi),
-    `Q10 (Wood 2025)`      = fmt_n(Q10_wood),
-    `VWC optimum (m³ m⁻³)` = fmt_n(optimum, 3)
-  )
+has_q10 <- !is.null(q10_tbl) && !"status" %in% names(q10_tbl) &&
+  all(c("treatment", "Q10", "Q10_lo", "Q10_hi") %in% names(q10_tbl))
+has_vwc_opt <- !is.null(vwc_opt) && !"status" %in% names(vwc_opt) &&
+  all(c("treatment", "optimum") %in% names(vwc_opt))
+
+if (has_q10 && has_vwc_opt) {
+  tab3 <- q10_tbl |>
+    left_join(q10_wood, by = "treatment") |>
+    left_join(vwc_opt |> select(treatment, optimum), by = "treatment") |>
+    transmute(
+      Treatment              = treatment,
+      `Q10 (this study)`     = fmt_n(Q10),
+      `Q10 95% CI`           = ci(Q10_lo, Q10_hi),
+      `Q10 (Wood 2025)`      = fmt_n(Q10_wood),
+      `VWC optimum (m³ m⁻³)` = fmt_n(optimum, 3)
+    )
+} else {
+  tab3 <- tibble(Treatment = "(Q10/VWC-optimum output unavailable)")
+}
 ft3 <- style_ft(flextable(tab3))
 
-q10_red_pct <- if (!is.null(q10_tbl) && all(c("control","warmed") %in% q10_tbl$treatment))
+q10_red_pct <- if (has_q10 && all(c("control","warmed") %in% q10_tbl$treatment))
   100 * (q10_tbl$Q10[q10_tbl$treatment == "control"] -
          q10_tbl$Q10[q10_tbl$treatment == "warmed"]) /
         q10_tbl$Q10[q10_tbl$treatment == "control"] else NA_real_
-vwc_opt_shift <- if (!is.null(vwc_opt) && all(c("control","warmed") %in% vwc_opt$treatment))
+vwc_opt_shift <- if (has_vwc_opt && all(c("control","warmed") %in% vwc_opt$treatment))
   vwc_opt$optimum[vwc_opt$treatment == "control"] -
   vwc_opt$optimum[vwc_opt$treatment == "warmed"] else NA_real_
 
-tab3_note <- sprintf(
-  "Apparent Q10 changed by %s%% under warming (control %s, warmed %s). VWC optimum shifted toward drier soil by %s m\u00B3 m\u207B\u00B3 (control %s, warmed %s). Wood et al. (2025) reported a first-experimental-year Q10 of 2.51 (control) and 0.71 (warmed); SD 1.23 and 1.30.",
+tab3_note <- if (has_q10 && has_vwc_opt) sprintf(
+  "Apparent Q10 changed by %s%% under warming (control %s, warmed %s). VWC optimum shifted toward drier soil by %s m³ m⁻³ (control %s, warmed %s). Wood et al. (2025) reported a first-experimental-year Q10 of 2.51 (control) and 0.71 (warmed); SD 1.23 and 1.30.",
   fmt_n(q10_red_pct, 1),
   fmt_n(q10_tbl$Q10[q10_tbl$treatment == "control"], 2),
   fmt_n(q10_tbl$Q10[q10_tbl$treatment == "warmed"],  2),
   fmt_n(vwc_opt_shift, 3),
   fmt_n(vwc_opt$optimum[vwc_opt$treatment == "control"], 3),
   fmt_n(vwc_opt$optimum[vwc_opt$treatment == "warmed"],  3)
-)
+) else "Q10 and/or VWC-optimum output was unavailable; no derived quantities are reported."
+
 
 q10_c  <- read_safe(file.path(tab_dir, "q10_contrast.csv"))
 vopt_c <- read_safe(file.path(tab_dir, "vwc_optimum_contrast.csv"))
@@ -240,7 +250,9 @@ tabS1 <- bind_rows(
   build_coef(mech_path_coef, "Pathway"),
   build_coef(mech_mod_coef,  "Modification")
 )
-if (nrow(tabS1) == 0) tabS1 <- tibble(Term = "(coefficient files missing)")
+if (nrow(tabS1) == 0) tabS1 <- tibble(Model = "(unavailable)",
+                                      Term = "(coefficient files missing)",
+                                      Estimate = "-", SE = "-", p = "-")
 ftS1 <- style_ft(flextable(tabS1)) |> merge_v(j = "Model")
 
 # ============================================================================
