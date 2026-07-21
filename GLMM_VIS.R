@@ -320,20 +320,20 @@ custom_breaks <- sort(as.Date(paste0(data_years, "-01-01")))
 
 create_delta_plot <- function(daily_data, var_name, y_lab, title_txt,
                               line_col, show_x = FALSE) {
-  model <- switch(var_name, flux_mean = m_flux_i, temp_mean = m_temp_i, vwc_mean = m_vwc_i)
-  model_data <- if (identical(var_name, "flux_mean")) d_flux else d_analysis
-  # Marginal fitted contrasts by modelled Year x season; regrid supplies
-  # response-scale differences and delta-method confidence intervals.
-  emm <- emmeans(model, ~ Treatment | Year_f * season, data = model_data)
-  ct <- as.data.frame(contrast(regrid(emm), method = "revpairwise")) |>
-    transmute(Year_f, season, Delta = estimate,
-              Delta_Min = lower.CL, Delta_Max = upper.CL)
-  if (identical(var_name, "vwc_mean")) ct <- ct |>
-    mutate(across(c(Delta, Delta_Min, Delta_Max), ~ .x / 100))
+  # Daily treatment differences are shown descriptively. The ribbon is the
+  # same-day between-plot SE, not a model-based confidence interval.
   agg <- daily_data |>
-    distinct(Date, Year_f, season) |>
-    left_join(ct, by = c("Year_f", "season")) |>
-    filter(is.finite(Delta), is.finite(Delta_Min), is.finite(Delta_Max)) |>
+    group_by(Date, Treatment) |>
+    summarise(mean_val = mean(.data[[var_name]], na.rm = TRUE),
+              se_val   = sd(.data[[var_name]], na.rm = TRUE) /
+                         sqrt(sum(!is.na(.data[[var_name]]))),
+              .groups  = "drop") |>
+    pivot_wider(names_from = Treatment, values_from = c(mean_val, se_val)) |>
+    mutate(Delta     = mean_val_warmed - mean_val_control,
+           Delta_SE  = sqrt(se_val_warmed^2 + se_val_control^2),
+           Delta_Min = Delta - Delta_SE,
+           Delta_Max = Delta + Delta_SE) |>
+    filter(is.finite(Delta), is.finite(Delta_SE)) |>
     arrange(Date)
   seg <- segment_series(agg, date_col = "Date", y_col = "Delta", gap_days = 1)
 
@@ -364,7 +364,8 @@ f5b <- create_delta_plot(d_analysis, "temp_mean",
 f5c <- create_delta_plot(d_analysis, "vwc_mean",
         expression(Delta~VWC~(m^3~m^-3)),               "(C) Soil moisture",     "#E69F00",
         show_x = TRUE)
-fig5 <- f5a / f5b / f5c
+fig5 <- f5a / f5b / f5c +
+  plot_annotation(subtitle = "Descriptive daily warmed-minus-control differences; ribbons are same-day between-plot SEs, not model-based confidence intervals.")
 save_fig(fig5, "Figure5_DailyDelta", width = 12, height = 10)
 
 # ============================================================================
@@ -564,14 +565,21 @@ m_plot_q10 <- tryCatch(
   error = function(e) e)
 if (inherits(m_plot_q10, "glmmTMB") && isTRUE(m_plot_q10$sdr$pdHess)) {
   fixed <- fixef(m_plot_q10)$cond
-  slopes <- ranef(m_plot_q10)$cond$Plot[, "temp_c", drop = TRUE]
+  trt_temp_term <- grep("(^Treatmentwarmed:temp_c$|^temp_c:Treatmentwarmed$)",
+                        names(fixed), value = TRUE)
+  if (length(trt_temp_term) != 1L) {
+    stop("Could not identify the warmed-by-temperature fixed-effect term.")
+  }
+  plot_re <- ranef(m_plot_q10)$cond$Plot
+  slopes <- setNames(plot_re[, "temp_c"], rownames(plot_re))
   plot_trt <- d_flux |> distinct(Plot, Treatment)
   q10_plot <- plot_trt |>
     mutate(fixed_slope = if_else(Treatment == "warmed",
-                                 fixed[["temp_c"]] + fixed[["Treatmentwarmed:temp_c"]],
+                                 fixed[["temp_c"]] + fixed[[trt_temp_term]],
                                  fixed[["temp_c"]]),
-           slope = fixed_slope + unname(slopes[as.character(Plot)]),
-           Q10 = exp(10 * slope))
+           slope = fixed_slope + slopes[as.character(Plot)],
+           Q10 = exp(10 * slope)) |>
+    filter(is.finite(Q10))
   write_csv(q10_plot, file.path(tab_dir, "q10_per_plot_supplementary.csv"))
   p_s6 <- ggplot(q10_plot, aes(x = factor(Plot), y = Q10, colour = Treatment)) +
     geom_hline(yintercept = 1, linetype = 3, colour = "grey50") +
